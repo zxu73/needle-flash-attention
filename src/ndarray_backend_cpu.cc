@@ -494,6 +494,112 @@ void FlashAttentionFwd(const AlignedArray& q, const AlignedArray& k, const Align
   }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// FlashAttention-style fused attention (backward)
+////////////////////////////////////////////////////////////////////////////////
+
+void FlashAttentionBwd(const AlignedArray& q, const AlignedArray& k, const AlignedArray& v,
+                       const AlignedArray& out, const AlignedArray& lse, const AlignedArray& dout,
+                       AlignedArray* dq, AlignedArray* dk, AlignedArray* dv, uint32_t BH,
+                       uint32_t Nq, uint32_t Nk, uint32_t D, scalar_t scale, bool causal,
+                       uint32_t Br, uint32_t Bc) {
+  /**
+   * Backward pass of FlashAttentionFwd: given dout, the adjoint of out, compute the adjoints of
+   * q, k and v without materializing the (Nq x Nk) probability matrix.
+   *
+   * With S = scale * Q K^T + mask, P = softmax(S) and out = P V, each entry of P is recomputed
+   * from the saved row log-sum-exp, and the row sums of the softmax Jacobian come for free from
+   * the forward output (sum_j P_ij v_j = out_i):
+   *     P_ij    = exp(S_ij - lse_i)
+   *     delta_i = sum_j P_ij (dout_i . v_j) = dout_i . out_i
+   *     dS_ij   = P_ij * (dout_i . v_j - delta_i)
+   *     dq_i   += scale * dS_ij * k_j
+   *     dk_j   += scale * dS_ij * q_i
+   *     dv_j   += P_ij * dout_i
+   * The (i, j) pairs are visited one (query tile, key tile) block at a time, so the rows a block
+   * reads and accumulates into (Br of q/dout/dq, Bc of k/v/dk/dv) stay in cache.  Workspace is
+   * O(Br), independent of the sequence lengths.
+   *
+   * Args:
+   *   q, k, v: the forward inputs, compact (BH, Nq, D) and (BH, Nk, D)
+   *   out, lse: the forward outputs, compact (BH, Nq, D) and (BH, Nq)
+   *   dout: compact (BH, Nq, D) adjoint of out
+   *   dq, dk, dv: compact adjoints of q, k, v to write into (overwritten, not accumulated)
+   *   scale, causal, Br, Bc: as in FlashAttentionFwd.  Rows that see no key (lse = -inf) only
+   *           have masked entries, so they are skipped and contribute nothing.
+   */
+  const int64_t diag = (int64_t)Nk - (int64_t)Nq;
+
+  std::fill(dq->ptr, dq->ptr + dq->size, 0.0f);
+  std::fill(dk->ptr, dk->ptr + dk->size, 0.0f);
+  std::fill(dv->ptr, dv->ptr + dv->size, 0.0f);
+  std::vector<scalar_t> delta(Br);
+
+  for (size_t bh = 0; bh < BH; bh++) {
+    const scalar_t* Q = q.ptr + bh * Nq * D;
+    const scalar_t* K = k.ptr + bh * Nk * D;
+    const scalar_t* V = v.ptr + bh * Nk * D;
+    const scalar_t* O = out.ptr + bh * Nq * D;
+    const scalar_t* G = dout.ptr + bh * Nq * D;
+    const scalar_t* L = lse.ptr + bh * Nq;
+    scalar_t* dQ = dq->ptr + bh * Nq * D;
+    scalar_t* dK = dk->ptr + bh * Nk * D;
+    scalar_t* dV = dv->ptr + bh * Nk * D;
+
+    for (uint32_t i0 = 0; i0 < Nq; i0 += Br) {
+      const uint32_t br = std::min(Br, Nq - i0);
+
+      // delta_i = dout_i . out_i
+      for (uint32_t r = 0; r < br; r++) {
+        const scalar_t* g_row = G + (size_t)(i0 + r) * D;
+        const scalar_t* o_row = O + (size_t)(i0 + r) * D;
+        scalar_t dot = 0;
+        for (uint32_t d = 0; d < D; d++) dot += g_row[d] * o_row[d];
+        delta[r] = dot;
+      }
+
+      // keys past j_end are invisible to every row of this tile under the causal mask
+      int64_t j_end = Nk;
+      if (causal) j_end = std::max<int64_t>(0, std::min<int64_t>(Nk, (int64_t)i0 + br + diag));
+
+      for (int64_t j0 = 0; j0 < j_end; j0 += Bc) {
+        const uint32_t bc = (uint32_t)std::min<int64_t>(Bc, j_end - j0);
+
+        for (uint32_t r = 0; r < br; r++) {
+          const size_t i = i0 + r;
+          const scalar_t* q_row = Q + i * D;
+          const scalar_t* g_row = G + i * D;
+          scalar_t* dq_row = dQ + i * D;
+          const int64_t last_visible = (int64_t)i + diag;
+
+          for (uint32_t c = 0; c < bc; c++) {
+            const int64_t j = j0 + c;
+            if (causal && j > last_visible) break;  // the rest of this row's tile is masked
+            const scalar_t* k_row = K + (size_t)j * D;
+            const scalar_t* v_row = V + (size_t)j * D;
+            scalar_t* dk_row = dK + (size_t)j * D;
+            scalar_t* dv_row = dV + (size_t)j * D;
+
+            scalar_t s = 0, dp = 0;
+            for (uint32_t d = 0; d < D; d++) {
+              s += q_row[d] * k_row[d];
+              dp += g_row[d] * v_row[d];
+            }
+            const scalar_t p = std::exp(s * scale - L[i]);
+            const scalar_t ds = scale * p * (dp - delta[r]);  // scale folded into dS
+
+            for (uint32_t d = 0; d < D; d++) {
+              dq_row[d] += ds * k_row[d];
+              dk_row[d] += ds * q_row[d];
+              dv_row[d] += p * g_row[d];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace cpu
 }  // namespace needle
 
@@ -556,4 +662,5 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
   m.def("reduce_sum", ReduceSum);
 
   m.def("flash_attention_fwd", FlashAttentionFwd);
+  m.def("flash_attention_bwd", FlashAttentionBwd);
 }

@@ -18,7 +18,13 @@ const size_t ELEM_SIZE = sizeof(scalar_t);
 struct CudaArray {
   CudaArray(const size_t size) {
     cudaError_t err = cudaMalloc(&ptr, size * ELEM_SIZE);
-    if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+    if (err != cudaSuccess) {
+      // The runtime also remembers the failure as its "last error" until that is read.  It is
+      // reported right here, so reset it: otherwise the next call that checks
+      // cudaGetLastError() would blame itself for this allocation.
+      cudaGetLastError();
+      throw std::runtime_error(cudaGetErrorString(err));
+    }
     this->size = size;
   }
   ~CudaArray() { cudaFree(ptr); }
@@ -581,6 +587,7 @@ void FlashAttentionFwd(const CudaArray& q, const CudaArray& k, const CudaArray& 
   if (BH == 0 || Nq == 0) return;
   dim3 grid((Nq + FA_BR - 1) / FA_BR, BH, 1);
   dim3 block(FA_BR, 1, 1);
+  cudaGetLastError();  // discard any stale error, so the check below only sees this launch
 
 #define FA_LAUNCH(MD) \
   FlashAttentionFwdKernel<MD>                                                                  \
@@ -590,6 +597,235 @@ void FlashAttentionFwd(const CudaArray& q, const CudaArray& k, const CudaArray& 
   else if (D <= 64) FA_LAUNCH(64);
   else if (D <= 128) FA_LAUNCH(128);
   else throw std::runtime_error("flash_attention_fwd: head dim > 128 is not supported on cuda");
+#undef FA_LAUNCH
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// FlashAttention-style fused attention (backward)
+////////////////////////////////////////////////////////////////////////////////
+
+// Backward pass, see the CPU backend for the derivation.  With P_ij = exp(s_ij - lse_i) recomputed
+// from the saved log-sum-exp and delta_i = dout_i . out_i:
+//     dS_ij = P_ij * (dout_i . v_j - delta_i)
+//     dq_i  = scale * sum_j dS_ij k_j        (a sum over keys, one per query row)
+//     dk_j  = scale * sum_i dS_ij q_i        (a sum over queries, one per key row)
+//     dv_j  = sum_i P_ij dout_i              (a sum over queries, one per key row)
+// dq is gathered by a kernel with one thread per query row and dk, dv by a second kernel with one
+// thread per key row.  Every thread then owns the rows it writes, so no atomics are needed and
+// the result is deterministic, at the price of evaluating the scores once in each kernel.
+#if FA_BC > FA_BR
+#error "the backward kernels stage one tile row per thread: FA_BC must not exceed FA_BR"
+#endif
+
+template <int MAX_D>
+__global__ void FlashAttentionBwdQueryKernel(const scalar_t* q, const scalar_t* k,
+                                             const scalar_t* v, const scalar_t* out,
+                                             const scalar_t* lse, const scalar_t* dout,
+                                             scalar_t* dq, uint32_t Nq, uint32_t Nk, uint32_t D,
+                                             scalar_t scale, bool causal) {
+  // Same layout as the forward kernel: thread r owns query row i, key / value tiles of FA_BC rows
+  // are staged through shared memory.
+  __shared__ scalar_t Ks[FA_BC][MAX_D];
+  __shared__ scalar_t Vs[FA_BC][MAX_D];
+
+  const size_t bh = blockIdx.y;
+  const int r = threadIdx.x;
+  const int64_t i = (int64_t)blockIdx.x * FA_BR + r;
+  const bool valid = i < Nq;
+  const int64_t diag = (int64_t)Nk - (int64_t)Nq;  // query i sees keys j <= i + diag (causal)
+
+  const scalar_t* Q = q + bh * Nq * D;
+  const scalar_t* K = k + bh * Nk * D;
+  const scalar_t* V = v + bh * Nk * D;
+  const scalar_t* O = out + bh * Nq * D;
+  const scalar_t* G = dout + bh * Nq * D;
+
+  // this row's scaled q, dout and dq accumulator; padding dims (d >= D) are zero
+  scalar_t q_reg[MAX_D], g_reg[MAX_D], acc[MAX_D];
+  scalar_t delta = 0.0f;
+#pragma unroll
+  for (int d = 0; d < MAX_D; d++) {
+    const bool in = valid && d < D;
+    q_reg[d] = in ? Q[i * D + d] * scale : 0.0f;
+    g_reg[d] = in ? G[i * D + d] : 0.0f;
+    acc[d] = 0.0f;
+    if (in) delta += G[i * D + d] * O[i * D + d];
+  }
+  const scalar_t lse_i = valid ? lse[bh * Nq + i] : 0.0f;
+
+  // keys past j_end are invisible to every row in this block under the causal mask
+  int64_t j_end = Nk;
+  if (causal) {
+    int64_t last_row = min((int64_t)blockIdx.x * FA_BR + FA_BR, (int64_t)Nq) - 1;
+    j_end = max((int64_t)0, min((int64_t)Nk, last_row + diag + 1));
+  }
+
+  for (int64_t j0 = 0; j0 < j_end; j0 += FA_BC) {
+    // cooperatively stage K_j, V_j (zero-padded past Nk and D) in shared memory
+    for (int idx = r; idx < FA_BC * MAX_D; idx += FA_BR) {
+      const int c = idx / MAX_D, d = idx % MAX_D;
+      const int64_t j = j0 + c;
+      const bool in = j < Nk && d < D;
+      Ks[c][d] = in ? K[j * D + d] : 0.0f;
+      Vs[c][d] = in ? V[j * D + d] : 0.0f;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int c = 0; c < FA_BC; c++) {
+      scalar_t s = 0.0f, dp = 0.0f;
+#pragma unroll
+      for (int d = 0; d < MAX_D; d++) {
+        s += q_reg[d] * Ks[c][d];
+        dp += g_reg[d] * Vs[c][d];
+      }
+      const int64_t j = j0 + c;
+      const bool visible = valid && j < Nk && (!causal || j <= i + diag);
+      // a row with lse = -inf sees no key, so it never reaches the exp
+      const scalar_t ds = visible ? expf(s - lse_i) * (dp - delta) : 0.0f;
+#pragma unroll
+      for (int d = 0; d < MAX_D; d++) acc[d] += ds * Ks[c][d];
+    }
+    __syncthreads();  // the tile is about to be overwritten
+  }
+
+  if (valid) {
+    scalar_t* dq_row = dq + (bh * Nq + i) * D;
+#pragma unroll
+    for (int d = 0; d < MAX_D; d++)
+      if (d < D) dq_row[d] = acc[d] * scale;
+  }
+}
+
+template <int MAX_D>
+__global__ void FlashAttentionBwdKeyKernel(const scalar_t* q, const scalar_t* k, const scalar_t* v,
+                                           const scalar_t* out, const scalar_t* lse,
+                                           const scalar_t* dout, scalar_t* dk, scalar_t* dv,
+                                           uint32_t Nq, uint32_t Nk, uint32_t D, scalar_t scale,
+                                           bool causal) {
+  // The transpose of the query kernel: thread r owns key row j, and tiles of FA_BC query rows
+  // (scaled q, dout, and the per-row lse and delta) are staged through shared memory.
+  __shared__ scalar_t Qs[FA_BC][MAX_D];
+  __shared__ scalar_t Gs[FA_BC][MAX_D];
+  __shared__ scalar_t lse_s[FA_BC];
+  __shared__ scalar_t delta_s[FA_BC];
+
+  const size_t bh = blockIdx.y;
+  const int r = threadIdx.x;
+  const int64_t j = (int64_t)blockIdx.x * FA_BR + r;
+  const bool valid = j < Nk;
+  const int64_t diag = (int64_t)Nk - (int64_t)Nq;  // key j is seen by queries i >= j - diag (causal)
+
+  const scalar_t* Q = q + bh * Nq * D;
+  const scalar_t* K = k + bh * Nk * D;
+  const scalar_t* V = v + bh * Nk * D;
+  const scalar_t* O = out + bh * Nq * D;
+  const scalar_t* G = dout + bh * Nq * D;
+  const scalar_t* L = lse + bh * Nq;
+
+  // this row's k, v and dk, dv accumulators; padding dims (d >= D) are zero
+  scalar_t k_reg[MAX_D], v_reg[MAX_D], acc_k[MAX_D], acc_v[MAX_D];
+#pragma unroll
+  for (int d = 0; d < MAX_D; d++) {
+    const bool in = valid && d < D;
+    k_reg[d] = in ? K[j * D + d] : 0.0f;
+    v_reg[d] = in ? V[j * D + d] : 0.0f;
+    acc_k[d] = 0.0f;
+    acc_v[d] = 0.0f;
+  }
+
+  // queries before i_begin see no key of this block under the causal mask
+  int64_t i_begin = 0;
+  if (causal) i_begin = max((int64_t)0, (int64_t)blockIdx.x * FA_BR - diag);
+
+  for (int64_t i0 = i_begin; i0 < Nq; i0 += FA_BC) {
+    // cooperatively stage scale * Q_i and dout_i (zero-padded past Nq and D) in shared memory
+    for (int idx = r; idx < FA_BC * MAX_D; idx += FA_BR) {
+      const int c = idx / MAX_D, d = idx % MAX_D;
+      const int64_t i = i0 + c;
+      const bool in = i < Nq && d < D;
+      Qs[c][d] = in ? Q[i * D + d] * scale : 0.0f;
+      Gs[c][d] = in ? G[i * D + d] : 0.0f;
+    }
+    // the first FA_BC threads also stage lse_i and delta_i = dout_i . out_i, one row each
+    if (r < FA_BC) {
+      const int64_t i = i0 + r;
+      scalar_t delta = 0.0f;
+      if (i < Nq)
+        for (uint32_t d = 0; d < D; d++) delta += G[i * D + d] * O[i * D + d];
+      lse_s[r] = i < Nq ? L[i] : 0.0f;
+      delta_s[r] = delta;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int c = 0; c < FA_BC; c++) {
+      scalar_t s = 0.0f, dp = 0.0f;
+#pragma unroll
+      for (int d = 0; d < MAX_D; d++) {
+        s += k_reg[d] * Qs[c][d];
+        dp += v_reg[d] * Gs[c][d];
+      }
+      const int64_t i = i0 + c;
+      const bool visible = valid && i < Nq && (!causal || j <= i + diag);
+      // a row with lse = -inf sees no key, so it never reaches the exp
+      const scalar_t p = visible ? expf(s - lse_s[c]) : 0.0f;
+      const scalar_t ds = p * (dp - delta_s[c]);
+#pragma unroll
+      for (int d = 0; d < MAX_D; d++) {
+        acc_k[d] += ds * Qs[c][d];  // Qs already carries scale
+        acc_v[d] += p * Gs[c][d];
+      }
+    }
+    __syncthreads();  // the tile is about to be overwritten
+  }
+
+  if (valid) {
+    scalar_t* dk_row = dk + (bh * Nk + j) * D;
+    scalar_t* dv_row = dv + (bh * Nk + j) * D;
+#pragma unroll
+    for (int d = 0; d < MAX_D; d++) {
+      if (d < D) {
+        dk_row[d] = acc_k[d];
+        dv_row[d] = acc_v[d];
+      }
+    }
+  }
+}
+
+void FlashAttentionBwd(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                       const CudaArray& out, const CudaArray& lse, const CudaArray& dout,
+                       CudaArray* dq, CudaArray* dk, CudaArray* dv, uint32_t BH, uint32_t Nq,
+                       uint32_t Nk, uint32_t D, scalar_t scale, bool causal) {
+  /**
+   * Backward pass of FlashAttentionFwd: writes the adjoints of q, k and v given dout, the adjoint
+   * of out; see the CPU backend for the full description of the arguments.  The (Nq x Nk)
+   * probability matrix never exists in global memory.  Supports head dims up to 128.
+   */
+  if (BH == 0) return;
+  dim3 block(FA_BR, 1, 1);
+  dim3 query_grid((Nq + FA_BR - 1) / FA_BR, BH, 1);
+  dim3 key_grid((Nk + FA_BR - 1) / FA_BR, BH, 1);
+  cudaGetLastError();  // discard any stale error, so the check below only sees these launches
+
+#define FA_LAUNCH(MD)                                                                          \
+  do {                                                                                         \
+    if (Nq > 0)                                                                                \
+      FlashAttentionBwdQueryKernel<MD><<<query_grid, block>>>(                                 \
+          q.ptr, k.ptr, v.ptr, out.ptr, lse.ptr, dout.ptr, dq->ptr, Nq, Nk, D, scale, causal); \
+    if (Nk > 0)                                                                                \
+      FlashAttentionBwdKeyKernel<MD><<<key_grid, block>>>(q.ptr, k.ptr, v.ptr, out.ptr,        \
+                                                          lse.ptr, dout.ptr, dk->ptr, dv->ptr, \
+                                                          Nq, Nk, D, scale, causal);           \
+  } while (0)
+  if (D <= 16) FA_LAUNCH(16);
+  else if (D <= 32) FA_LAUNCH(32);
+  else if (D <= 64) FA_LAUNCH(64);
+  else if (D <= 128) FA_LAUNCH(128);
+  else throw std::runtime_error("flash_attention_bwd: head dim > 128 is not supported on cuda");
 #undef FA_LAUNCH
 
   cudaError_t err = cudaGetLastError();
@@ -667,4 +903,5 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
   m.def("reduce_sum", ReduceSum);
 
   m.def("flash_attention_fwd", FlashAttentionFwd);
+  m.def("flash_attention_bwd", FlashAttentionBwd);
 }

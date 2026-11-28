@@ -19,12 +19,19 @@ from .nn_basic import (
 class MultiHeadAttention(Module):
     """
     The multi-head self attention module.
+
+    With flash=True the attention is computed by the fused, memory-efficient
+    ops.flash_attention instead of materializing the (queries_len, keys_values_len)
+    score matrix.  The result is the same, but the attention probabilities are
+    never formed: forward() returns None in their place, and the dropout on them
+    is not applied.
     """
     def __init__(
         self,
         *,
         dropout = 0.,
         causal = False,
+        flash = False,
         device = None,
         dtype = "float32",
     ):
@@ -35,6 +42,7 @@ class MultiHeadAttention(Module):
         self.dtype = dtype
 
         self.causal = causal
+        self.flash = flash
         self.dropout = Dropout(dropout)
 
     def create_causal_mask(self, i, j, device):
@@ -97,7 +105,8 @@ class MultiHeadAttention(Module):
         """
         The forward function of the MultiHeadAttention activation function.
         Input: three states q, k, v, with shape (batch_size, num_head, seq_len, dim_head)
-        Output: the activation output `result` and attention softmax probability `probs` (with dropout applied)
+        Output: the activation output `result` and attention softmax probability `probs` (with dropout applied);
+                `probs` is None when flash=True
         """
         batch_size, num_head, queries_len, q_dim = q.shape
         _, _, keys_values_len, k_dim = k.shape
@@ -109,6 +118,10 @@ class MultiHeadAttention(Module):
         probs = None
 
         ### BEGIN YOUR SOLUTION
+        if self.flash:
+            # one fused op for scores, mask, softmax and the product with v
+            return ops.flash_attention(q, k, v, causal=self.causal), None
+
         # self.matmul(a, b) computes a @ b^T over the last two axes, so the keys
         # go in as-is: (B, H, Tq, D) x (B, H, Tk, D) -> (B, H, Tq, Tk)
         logits = self.matmul(q, k) / np.sqrt(q_dim)
@@ -142,6 +155,7 @@ class AttentionLayer(Module):
         out_features: int = None,
         dropout = 0.,
         causal = True,
+        flash = False,
         device = None,
         dtype = "float32",
     ):
@@ -186,7 +200,7 @@ class AttentionLayer(Module):
             device=device, dtype=dtype)
 
         self.attn = MultiHeadAttention(
-            dropout=dropout, causal=causal,
+            dropout=dropout, causal=causal, flash=flash,
             device=device, dtype=dtype)
 
         self.out_projection = Linear(
@@ -203,6 +217,7 @@ class AttentionLayer(Module):
                `k` (if not None) with shape (batch_size, kv_len, k_dim)
                `v` (if not None) with shape (batch_size, kv_len, v_dim)
         Output: the output `result` with shape (batch_size, kv_len, out_features)
+        The attention probabilities are kept in `self.probs` (None when flash=True).
         """
 
         if k is None:
@@ -252,6 +267,7 @@ class TransformerLayer(Module):
         *,
         dropout = 0.,
         causal = True,
+        flash = False,
         device = None,
         dtype = "float32",
     ):
@@ -268,7 +284,7 @@ class TransformerLayer(Module):
         # x = x + Dropout(Attention(x))   (attention has its own prenorm)
         self.attn = AttentionLayer(
             q_features, num_head, dim_head,
-            dropout=dropout, causal=causal, device=device, dtype=dtype)
+            dropout=dropout, causal=causal, flash=flash, device=device, dtype=dtype)
         self.dropout_attn = Dropout(dropout)
 
         # x = x + Dropout(Linear2(Dropout(ReLU(Linear1(LayerNorm(x))))))
@@ -319,11 +335,17 @@ class Transformer(Module):
         dim_head: int = 32,
         dropout = 0.,
         causal = True,
+        flash = False,
         device = None,
         dtype = "float32",
         batch_first = False,
         sequence_len = 2048
     ):
+        """
+        flash=True makes every layer attend through ops.flash_attention, whose
+        extra memory is linear rather than quadratic in the sequence length
+        (see MultiHeadAttention).  The parameters are the same either way.
+        """
 
         super().__init__()
 
@@ -342,7 +364,7 @@ class Transformer(Module):
         self.layers = Sequential(*[
             TransformerLayer(
                 embedding_size, num_head, dim_head, hidden_size,
-                dropout=dropout, causal=causal, device=device, dtype=dtype)
+                dropout=dropout, causal=causal, flash=flash, device=device, dtype=dtype)
             for _ in range(num_layers)
         ])
         ### END YOUR SOLUTION

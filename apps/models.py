@@ -43,7 +43,7 @@ class ResNet9(ndl.nn.Module):
 
 class LanguageModel(nn.Module):
     def __init__(self, embedding_size, output_size, hidden_size, num_layers=1,
-                 seq_model='rnn', seq_len=40, device=None, dtype="float32"):
+                 seq_model='rnn', seq_len=40, flash=False, device=None, dtype="float32"):
         """
         Consists of an embedding layer, a sequence model (either RNN or LSTM), and a
         linear layer.
@@ -53,6 +53,7 @@ class LanguageModel(nn.Module):
         hidden_size: The number of features in the hidden state of LSTM or RNN
         seq_model: 'rnn' or 'lstm', whether to use RNN or LSTM
         num_layers: Number of layers in RNN or LSTM
+        flash: for seq_model='transformer', attend through ops.flash_attention
         """
         super(LanguageModel, self).__init__()
         ### BEGIN YOUR SOLUTION
@@ -70,7 +71,7 @@ class LanguageModel(nn.Module):
             # (and hence the transformer's output) stays at embedding_size.
             # Inputs here are (seq_len, bs, ...), so batch_first=False.
             self.seq_model = nn.Transformer(embedding_size, hidden_size, num_layers,
-                                            device=device, dtype=dtype,
+                                            flash=flash, device=device, dtype=dtype,
                                             batch_first=False, sequence_len=seq_len)
         else:
             raise ValueError(f"Unknown seq_model '{seq_model}', "

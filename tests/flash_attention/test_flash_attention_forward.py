@@ -146,6 +146,17 @@ def test_matches_multihead_attention(device, causal):
     np.testing.assert_allclose(out.numpy(), expected.numpy(), rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("device", _DEVICES, ids=_DEVICE_IDS)
+def test_matches_pytorch(device, causal):
+    torch = pytest.importorskip("torch")
+    q, k, v = _random_qkv(2, 3, 40, 40, 16, seed=9)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        *(torch.tensor(x) for x in (q, k, v)), is_causal=causal).numpy()
+    out, _ = _run_op(q, k, v, device, causal=causal)
+    np.testing.assert_allclose(out, expected, rtol=1e-4, atol=1e-5)
+
+
 @pytest.mark.parametrize("device", _DEVICES, ids=_DEVICE_IDS)
 def test_non_compact_inputs(device):
     # (B, N, H, D) -> (B, H, N, D) via transpose, as AttentionLayer produces
@@ -190,15 +201,14 @@ def test_never_allocates_full_score_matrix(monkeypatch):
     assert max(sizes) <= N * D
 
 
-def test_is_a_graph_node_and_backward_is_not_implemented_yet():
+def test_is_a_graph_node():
+    # the backward pass through this node is covered in test_flash_attention_backward.py
     q, k, v = _random_qkv(1, 1, 8, 8, 8)
     tq, tk, tv = (ndl.Tensor(x, device=ndl.cpu(), requires_grad=True) for x in (q, k, v))
     out = flash_attention(tq, tk, tv)
     assert isinstance(out, ndl.Tensor) and isinstance(out.op, FlashAttention)
     assert out.requires_grad
     assert len(out.inputs) == 3 and all(a is b for a, b in zip(out.inputs, (tq, tk, tv)))
-    with pytest.raises(NotImplementedError):
-        out.sum().backward()
 
 
 def test_shape_validation():
